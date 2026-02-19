@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; }
+  body {
+    background: #06060c;
+    display: flex; justify-content: center; align-items: center;
+    height: 100vh; overflow: hidden; cursor: pointer;
+  }
+  canvas { display: block; }
+  #overlay {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; justify-content: center; align-items: center;
+    flex-direction: column; gap: 8px; z-index: 10;
+  }
+  #overlay span { color: #445; font-family: 'Courier New', monospace; font-size: 11px; letter-spacing: 3px; }
+  #overlay .t { color: #667; font-size: 14px; letter-spacing: 6px; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <span class="t">朧 月</span>
+  <span class="sub">click to play</span>
+</div>
+<canvas id="c"></canvas>
+<script>
+// 朧月 — Generative Music Player
+// 都節音階による自律的音楽生成と視覚化
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W, H;
+
+function resize() {
+  W = cv.width = window.innerWidth;
+  H = cv.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// === Audio ===
+
+let AC, master, comp, reverb, delay, delFb, delMix, analyser;
+let started = false;
+
+// 都節音階 (D基準): D Eb G A Bb
+const BASE = [62, 63, 67, 69, 70]; // MIDI
+const POOL = [];
+for (let oct = -2; oct <= 2; oct++) {
+  BASE.forEach(n => POOL.push(n + oct * 12));
+}
+
+const A4 = 432; // ヴェルディ・ピッチ
+function midi2freq(m) { return A4 * Math.pow(2, (m - 69) / 12); }
+
+function initAudio() {
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+
+  // コンプレッサー
+  comp = AC.createDynamicsCompressor();
+  comp.threshold.value = -20;
+  comp.ratio.value = 4;
+
+  // リバーブ
+  reverb = AC.createConvolver();
+  const len = AC.sampleRate * 6;
+  const buf = AC.createBuffer(2, len, AC.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.2);
+    }
+  }
+  reverb.buffer = buf;
+
+  // ディレイ
+  delay = AC.createDelay(2);
+  delay.delayTime.value = 0.55;
+  delFb = AC.createGain();
+  delFb.gain.value = 0.35;
+  delMix = AC.createGain();
+  delMix.gain.value = 0.3;
+
+  delay.connect(delFb);
+  delFb.connect(delay);
+  delay.connect(delMix);
+
+  // マスター
+  master = AC.createGain();
+  master.gain.value = 0.5;
+
+  // アナライザ
+  analyser = AC.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.85;
+
+  // ルーティング
+  const dryGain = AC.createGain();
+  dryGain.gain.value = 0.7;
+  const revGain = AC.createGain();
+  revGain.gain.value = 0.5;
+
+  comp.connect(dryGain);
+  comp.connect(delay);
+  comp.connect(reverb);
+  delMix.connect(master);
+  dryGain.connect(master);
+  reverb.connect(revGain);
+  revGain.connect(master);
+  master.connect(analyser);
+  analyser.connect(AC.destination);
+}
+
+// === 音を鳴らす ===
+
+function playNote(midi, vel, dur, panX) {
+  const now = AC.currentTime;
+  const freq = midi2freq(midi);
+
+  const osc = AC.createOscillator();
+  const g = AC.createGain();
+  const pan = AC.createStereoPanner();
+
+  // 低音はsine、中音はtriangle、高音はsine+軽いdetune
+  if (midi < 55) {
+    osc.type = 'sine';
+  } else if (midi < 70) {
+    osc.type = 'triangle';
+  } else {
+    osc.type = 'sine';
+  }
+  osc.frequency.value = freq;
+  osc.detune.value = (Math.random() - 0.5) * 8;
+
+  pan.pan.value = panX || (Math.random() - 0.5) * 1.2;
+
+  // エンベロープ
+  const atk = 0.08 + Math.random() * 0.4;
+  const rel = dur * 0.6 + Math.random() * 0.5;
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(vel, now + atk);
+  g.gain.setValueAtTime(vel, now + dur - rel);
+  g.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+  osc.connect(g);
+  g.connect(pan);
+  pan.connect(comp);
+  osc.start(now);
+  osc.stop(now + dur + 0.1);
+
+  // 視覚化用に返す
+  return { freq, vel, dur, birth: performance.now(), panX: pan.pan.value };
+}
+
+// === ドローン ===
+
+let drones = [];
+
+function startDrone(midi, vol) {
+  const osc = AC.createOscillator();
+  const g = AC.createGain();
+  const lfo = AC.createOscillator();
+  const lfoG = AC.createGain();
+
+  osc.type = 'sine';
+  osc.frequency.value = midi2freq(midi);
+
+  lfo.type = 'sine';
+  lfo.frequency.value = 0.05 + Math.random() * 0.1;
+  lfoG.gain.value = vol * 0.3;
+
+  lfo.connect(lfoG);
+  lfoG.connect(g.gain);
+
+  g.gain.value = 0;
+  osc.connect(g);
+  g.connect(comp);
+  osc.start();
+  lfo.start();
+
+  // フェードイン
+  g.gain.linearRampToValueAtTime(vol, AC.currentTime + 8);
+
+  drones.push({ osc, g, lfo, lfoG, midi });
+}
+
+// === 生成ロジック ===
+
+let particles = [];
+let t = 0;
+let nextEvent = 0;
+let phrase = [];
+let phraseIdx = 0;
+let breath = 0; // 0~1 呼吸の位相
+let density = 0.5;
+
+// Perlin的な滑らかな乱数
+function smoothRand(seed, speed) {
+  return 0.5 + 0.5 * Math.sin(t * speed + seed * 7.3);
+}
+
+function generatePhrase() {
+  // フレーズ: 3~7音の短い旋律断片
+  const len = 3 + Math.floor(Math.random() * 5);
+  const center = POOL[Math.floor(POOL.length * 0.3 + Math.random() * POOL.length * 0.4)];
+  const ph = [];
+
+  let current = center;
+  for (let i = 0; i < len; i++) {
+    // 近い音を選ぶ（跳躍は稀に）
+    const leap = Math.random() < 0.15;
+    const candidates = POOL.filter(n => {
+      const d = Math.abs(n - current);
+      return leap ? (d > 5 && d < 15) : (d <= 5);
+    });
+    if (candidates.length > 0) {
+      current = candidates[Math.floor(Math.random() * candidates.length)];
+    }
+    ph.push(current);
+  }
+  return ph;
+}
+
+function scheduleNext() {
+  breath = smoothRand(1, 0.07);
+  density = 0.2 + breath * 0.6;
+
+  // 間（ま）——呼吸が浅いとき、沈黙が長くなる
+  const pause = (1 - density) * 4 + Math.random() * 2;
+
+  if (phraseIdx >= phrase.length || Math.random() < 0.3) {
+    phrase = generatePhrase();
+    phraseIdx = 0;
+  }
+
+  const midi = phrase[phraseIdx++];
+  const vel = 0.04 + smoothRand(midi, 0.13) * 0.08;
+  const dur = 1.5 + Math.random() * 4;
+  const pan = (Math.random() - 0.5) * 1.4;
+
+  const note = playNote(midi, vel, dur, pan);
+  particles.push(note);
+
+  // 時々、和音を重ねる
+  if (Math.random() < 0.25 * density) {
+    const harm = POOL.filter(n => {
+      const interval = Math.abs(n - midi) % 12;
+      return interval === 5 || interval === 7; // 4度 or 5度
+    });
+    if (harm.length > 0) {
+      const h = harm[Math.floor(Math.random() * harm.length)];
+      const hn = playNote(h, vel * 0.5, dur * 1.2, -pan);
+      particles.push(hn);
+    }
+  }
+
+  nextEvent = performance.now() + pause * 1000;
+}
+
+// === 視覚化 ===
+
+const waveData = new Uint8Array(1024);
+const freqData = new Uint8Array(512);
+
+function draw() {
+  requestAnimationFrame(draw);
+  t += 0.016;
+
+  ctx.fillStyle = 'rgba(6,6,12,0.08)';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!started) return;
+  if (!playing) return;
+
+  analyser.getByteTimeDomainData(waveData);
+  analyser.getByteFrequencyData(freqData);
+
+  const now = performance.now();
+
+  // スペクトラム — 水面のような横線
+  ctx.save();
+  for (let i = 0; i < 256; i++) {
+    const v = freqData[i] / 255;
+    if (v < 0.02) continue;
+    const x = (i / 256) * W;
+    const y = H * 0.5 + Math.sin(i * 0.05 + t * 0.5) * H * 0.15;
+    const alpha = v * 0.25;
+    ctx.fillStyle = `rgba(80,120,180,${alpha})`;
+    ctx.fillRect(x, y - v * 30, 3, v * 60);
+  }
+  ctx.restore();
+
+  // 波形 — 中央の細い線
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(150,180,220,0.3)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < waveData.length; i++) {
+    const x = (i / waveData.length) * W;
+    const v = (waveData[i] / 128 - 1) * H * 0.15;
+    const y = H / 2 + v;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // パーティクル — 音の粒
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    const age = (now - p.birth) / 1000;
+    const life = age / p.dur;
+
+    if (life > 1.5) {
+      particles.splice(i, 1);
+      continue;
+    }
+
+    const fadeIn = Math.min(1, age / 0.3);
+    const fadeOut = Math.max(0, 1 - (life - 0.8) / 0.7);
+    const alpha = fadeIn * fadeOut * p.vel * 8;
+
+    // 音高 → y位置（高い音ほど上）
+    const yNorm = 1 - (Math.log2(p.freq) - 5) / 5;
+    const y = H * 0.15 + yNorm * H * 0.7;
+    const x = W * 0.5 + p.panX * W * 0.35 + Math.sin(age * 0.8 + p.freq * 0.01) * 20;
+
+    // 円
+    const r = 2 + p.vel * 40 * fadeOut;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(160,190,230,${alpha * 0.6})`;
+    ctx.fill();
+
+    // グロー
+    const grad = ctx.createRadialGradient(x, y, 0, x, y, r * 4);
+    grad.addColorStop(0, `rgba(120,160,210,${alpha * 0.15})`);
+    grad.addColorStop(1, 'rgba(120,160,210,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(x - r * 4, y - r * 4, r * 8, r * 8);
+  }
+
+  // 次の音
+  if (now >= nextEvent) {
+    scheduleNext();
+  }
+}
+
+// === 開始 ===
+
+let playing = false;
+
+function fadeIn() {
+  playing = true;
+  document.getElementById('overlay').querySelector('.sub').textContent = 'click to pause';
+
+  if (!started) {
+    started = true;
+    initAudio();
+    startDrone(38, 0.06);
+    startDrone(45, 0.04);
+    startDrone(74, 0.015);
+    phrase = generatePhrase();
+    nextEvent = performance.now() + 2000;
+  } else {
+    AC.resume();
+    master.gain.linearRampToValueAtTime(0.5, AC.currentTime + 2);
+    drones.forEach(d => d.g.gain.linearRampToValueAtTime(0.06, AC.currentTime + 3));
+  }
+}
+
+function fadeOut() {
+  playing = false;
+  document.getElementById('overlay').querySelector('.sub').textContent = 'click to play';
+  const now = AC.currentTime;
+  master.gain.linearRampToValueAtTime(0, now + 3);
+  drones.forEach(d => d.g.gain.linearRampToValueAtTime(0, now + 3));
+  setTimeout(() => { if (!playing) AC.suspend(); }, 3500);
+}
+
+document.addEventListener('click', () => {
+  if (!playing) fadeIn();
+  else fadeOut();
+});
+
+draw();
+</script>
+</body>
+</html>
