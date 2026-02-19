@@ -1,4 +1,7 @@
 # Oborozuki 朧月
-Generative Music Player  
+A=432Hz Generative Music Web Player  
+  
 Usage: click to play/pause  
-Made with Claude Opus 4.6  
+https://yasuna-ide.github.io/Oborozuki/  
+  
+Made with Claude Opus 4.6
