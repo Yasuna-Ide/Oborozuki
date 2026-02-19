@@ -1,0 +1,2 @@
+# Oborozuki
+Generative Music Player
