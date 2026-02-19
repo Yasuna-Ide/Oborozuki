@@ -1,2 +1,2 @@
 # Oborozuki 朧月
-Generative Music Player
+A=432Hz Generative Music Player
